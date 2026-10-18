@@ -1,5 +1,5 @@
-
 import asyncio
+import json
 import logging
 import os
 import re
@@ -22,6 +22,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from dotenv import load_dotenv
+from groq import AsyncGroq
 
 # ==================== SOZLAMALAR ====================
 
@@ -29,6 +30,10 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
 DB_PATH = BASE_DIR / "smart_moliya.db"
 TZ = ZoneInfo("Asia/Tashkent")
 
@@ -41,7 +46,6 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 # Tasdiqlanishi kutilayotgan yozuvlar.
-# Ular faqat tasdiqlanganda bazaga yoziladi.
 pending_transactions = {}
 
 
@@ -210,18 +214,6 @@ def format_money(amount):
 
 
 def parse_amount(text):
-    """
-    Qabul qilinadigan misollar:
-    50000
-    50 ming
-    50k
-    2 mln
-    1.5 million
-
-    'min' qisqartmasi faqat pulga oid kontekstda
-    tabiiy matn tahlilida ishlatiladi.
-    """
-
     value = text.lower().strip().replace("\u00a0", " ")
 
     match = re.search(
@@ -246,20 +238,6 @@ def parse_amount(text):
         amount = int(number * multiplier)
         return amount if amount > 0 else None
 
-    # "10min" kabi pulga oid qisqartma:
-    # oddiy raqamning o'zi yetarli bo'lmaydi.
-    match = re.search(
-        r"(?<!\w)(\d+(?:[.,]\d+)?)\s*min(?!ut)(?!\w)",
-        value,
-        re.IGNORECASE,
-    )
-
-    if match:
-        number = float(match.group(1).replace(",", "."))
-        amount = int(number * 1_000)
-        return amount if amount > 0 else None
-
-    # Oddiy summa: 50000 yoki 50000 so'm.
     match = re.search(
         r"(?<!\w)(\d{4,})(?!\w)",
         value,
@@ -274,27 +252,12 @@ def parse_amount(text):
 
 def detect_category(text, kind):
     text = text.lower()
-
     categories = {
-        "Ovqat": [
-            "ovqat", "taom", "osh", "non", "tushlik",
-            "kechki ovqat", "kafe", "restoran",
-        ],
-        "Transport": [
-            "benzin", "taksi", "avtobus", "metro",
-            "yo'l", "yo‘l", "transport", "gaz",
-        ],
-        "Do'kon": [
-            "do'kon", "dokon", "market", "xarid",
-            "sotib oldim",
-        ],
-        "Uy": [
-            "ijara", "elektr", "svet", "suv",
-            "kommunal", "internet",
-        ],
-        "Oylik": [
-            "oylik", "maosh", "ish haqi", "ishdan",
-        ],
+        "Ovqat": ["ovqat", "taom", "osh", "non", "tushlik", "kechki ovqat", "kafe", "restoran"],
+        "Transport": ["benzin", "taksi", "avtobus", "metro", "yo'l", "yo‘l", "transport", "gaz"],
+        "Do'kon": ["do'kon", "dokon", "market", "xarid", "sotib oldim"],
+        "Uy": ["ijara", "elektr", "svet", "suv", "kommunal", "internet"],
+        "Oylik": ["oylik", "maosh", "ish haqi", "ishdan"],
         "Sovg'a": ["sovg'a", "sovga", "tug'ilgan kun"],
         "Ta'lim": ["kitob", "kurs", "o'qish", "maktab"],
         "Salomatlik": ["dori", "shifokor", "dorixona"],
@@ -307,15 +270,54 @@ def detect_category(text, kind):
     return "Boshqa kirim" if kind == "income" else "Boshqa chiqim"
 
 
-def parse_natural_transaction(text):
-    """
-    Bu hozircha oddiy qoidalar asosidagi dastlabki tahlil.
-    Groq AI keyingi bosqichda ulanadi.
-    """
+# --- GROQ AI ORQALI TAHLIL QILISH ---
+async def parse_with_groq(text: str):
+    if not groq_client:
+        return None
 
+    prompt = f"""
+    Sen moliyaviy yordamchi botning aqlli tahlilchisisan. Foydalanuvchi kiritgan matndan kirim yoki chiqim operatsiyasini aniqlagin.
+    Matn: "{text}"
+    
+    Quyidagi JSON formatida aniq javob qaytargin (boshqa matn yozma):
+    {{
+      "kind": "income" yoki "expense" (agar moliyaviy operatsiya bo'lmasa null),
+      "amount": raqam ko'rinishidagi summa (masalan 50000),
+      "category": "Mos keluvchi kategoriya (masalan: Ovqat, Transport, Do'kon, Oylik, Uy, Boshqa chiqim va hokazo)",
+      "note": "Asl izoh matni"
+    }}
+    Agar bu matn moliyaviy xarajat yoki kirim bo'lmasa, faqat {{"kind": null}} qaytar.
+    """
+    try:
+        response = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        res_data = json.loads(response.choices[0].message.content)
+        if res_data.get("kind") in ("income", "expense") and res_data.get("amount"):
+            return {
+                "kind": res_data["kind"],
+                "amount": int(res_data["amount"]),
+                "category": res_data.get("category", "Boshqa"),
+                "note": text.strip(),
+                "tx_date": now_local().date().isoformat(),
+            }
+    except Exception as e:
+        logger.error(f"Groq AI tahlilida xato: {e}")
+    
+    return None
+
+
+async def parse_natural_transaction(text):
+    # 1. Oldin Groq AI orqali harakat qilib ko'ramiz
+    ai_result = await parse_with_groq(text)
+    if ai_result:
+        return ai_result
+
+    # 2. Agar AI ishlamasa yoki ulanmagan bo'lsa, oddiy qoidalar asosidagi tahlilga o'tamiz
     lowered = text.lower().replace("’", "'").replace("ʻ", "'")
 
-    # Vaqtni pul deb noto'g'ri qabul qilmaslik.
     if re.search(r"\b(minut|minutda|daqiqa|soat)\b", lowered):
         return None
 
@@ -323,17 +325,8 @@ def parse_natural_transaction(text):
     if amount is None:
         return None
 
-    income_words = [
-        "oylik", "maosh", "daromad", "ish haqi",
-        "pul tushdi", "foyda oldim", "ishdan oldim",
-        "maosh oldim", "oylik oldim",
-    ]
-
-    expense_words = [
-        "ketdi", "ketti", "sarfladim", "ishlatdim",
-        "to'ladim", "to'lab berdim", "xarajat",
-        "xarj", "benzinga", "ovqatga",
-    ]
+    income_words = ["oylik", "maosh", "daromad", "ish haqi", "pul tushdi", "foyda oldim"]
+    expense_words = ["ketdi", "ketti", "sarfladim", "ishlatdim", "to'ladim", "xarajat", "xarj"]
 
     is_income = any(word in lowered for word in income_words)
     is_expense = any(word in lowered for word in expense_words)
@@ -343,17 +336,13 @@ def parse_natural_transaction(text):
     elif is_expense and not is_income:
         kind = "expense"
     else:
-        # Noaniq operatsiyalar avtomatik saqlanmaydi.
         return None
 
     tx_date = now_local().date()
-
     if "kecha" in lowered:
         tx_date -= timedelta(days=1)
 
     category = detect_category(lowered, kind)
-
-    # Foydalanuvchi yozgan izoh saqlanadi.
     note = text.strip()
 
     return {
@@ -371,14 +360,8 @@ def confirmation_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="✅ Tasdiqlash",
-                    callback_data="tx:confirm",
-                ),
-                InlineKeyboardButton(
-                    text="❌ Bekor qilish",
-                    callback_data="tx:cancel",
-                ),
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="tx:confirm"),
+                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="tx:cancel"),
             ]
         ]
     )
@@ -386,11 +369,7 @@ def confirmation_keyboard():
 
 async def ask_confirmation(message, user_id, data):
     pending_transactions[user_id] = data
-
-    kind_label = (
-        "➕ Kirim" if data["kind"] == "income"
-        else "➖ Chiqim"
-    )
+    kind_label = "➕ Kirim" if data["kind"] == "income" else "➖ Chiqim"
 
     await message.answer(
         "Quyidagi operatsiyani tekshir:\n\n"
@@ -441,7 +420,6 @@ async def confirm_transaction(callback: CallbackQuery):
 async def cancel_transaction(callback: CallbackQuery):
     pending_transactions.pop(callback.from_user.id, None)
     await callback.answer("Bekor qilindi.")
-
     if callback.message:
         await callback.message.edit_text("❌ Operatsiya saqlanmadi.")
 
@@ -451,14 +429,11 @@ async def cancel_transaction(callback: CallbackQuery):
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
-
     first_name = message.from_user.first_name or "do'stim"
-
     await message.answer(
         f"Assalomu alaykum, {first_name}! 👋\n\n"
         "💎 Smart Moliya Bot'ga xush kelibsiz!\n\n"
-        "Kirim va chiqimlarni qayd eting, balans va "
-        "hisobotlarni ko'ring.\n\n"
+        "Kirim va chiqimlarni qayd eting, balans va hisobotlarni ko'ring.\n"
         "Operatsiyalarni tugmalar yoki oddiy matn orqali kiriting.\n"
         "Masalan: 50 ming ovqatga ketdi",
         reply_markup=main_menu,
@@ -476,8 +451,7 @@ async def help_handler(message: Message):
         "📜 Tarix — oxirgi operatsiyalar\n\n"
         "Oddiy matn misollari:\n"
         "• 50 ming ovqatga ketdi\n"
-        "• 2 mln oylik oldim\n\n"
-        "Noaniq gaplar avtomatik saqlanmaydi."
+        "• 2 mln oylik oldim"
     )
 
 
@@ -485,10 +459,7 @@ async def help_handler(message: Message):
 async def cancel_form(message: Message, state: FSMContext):
     await state.clear()
     pending_transactions.pop(message.from_user.id, None)
-    await message.answer(
-        "Amal bekor qilindi.",
-        reply_markup=main_menu,
-    )
+    await message.answer("Amal bekor qilindi.", reply_markup=main_menu)
 
 
 # ==================== QO'LDA KIRIM / CHIQIM ====================
@@ -497,7 +468,6 @@ async def start_manual_transaction(message, state, kind):
     await state.clear()
     await state.update_data(kind=kind)
     await state.set_state(TransactionForm.amount)
-
     label = "kirim" if kind == "income" else "chiqim"
 
     await message.answer(
@@ -523,16 +493,11 @@ async def manual_amount(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     amount = parse_amount(text)
 
-    if amount is None:
-        # Sof raqam 4 xonali yoki undan katta bo'lsa ham qabul qilinadi.
-        if text.isdigit() and int(text) > 0:
-            amount = int(text)
+    if amount is None and text.isdigit() and int(text) > 0:
+        amount = int(text)
 
     if amount is None or amount <= 0:
-        await message.answer(
-            "Summani tushunmadim.\n"
-            "Masalan: 50000, 50 ming yoki 2 mln"
-        )
+        await message.answer("Summani tushunmadim. Masalan: 50000, 50 ming yoki 2 mln")
         return
 
     if amount > 10**12:
@@ -541,25 +506,18 @@ async def manual_amount(message: Message, state: FSMContext):
 
     await state.update_data(amount=amount)
     await state.set_state(TransactionForm.note)
-
-    await message.answer(
-        "📝 Endi izoh yoki kategoriya yoz.\n"
-        "Masalan: ovqat, oylik, benzin.\n\n"
-        "Bekor qilish: /cancel"
-    )
+    await message.answer("📝 Endi izoh yoki kategoriya yoz.\nMasalan: ovqat, oylik, benzin.\n\nBekor qilish: /cancel")
 
 
 @router.message(TransactionForm.note)
 async def manual_note(message: Message, state: FSMContext):
     note = (message.text or "").strip()
-
     if not note:
         await message.answer("Iltimos, izoh yoz. Masalan: ovqat yoki oylik.")
         return
 
     form_data = await state.get_data()
     await state.clear()
-
     kind = form_data["kind"]
 
     data = {
@@ -569,7 +527,6 @@ async def manual_note(message: Message, state: FSMContext):
         "note": note[:300],
         "tx_date": now_local().date().isoformat(),
     }
-
     await ask_confirmation(message, message.from_user.id, data)
 
 
@@ -598,25 +555,16 @@ async def report_handler(message: Message):
     today = now_local().date()
     month_start = today.replace(day=1)
 
-    today_income, today_expense = get_period_totals(
-        user_id, today.isoformat(), today.isoformat()
-    )
-
-    month_income, month_expense = get_period_totals(
-        user_id, month_start.isoformat(), today.isoformat()
-    )
-
-    categories = get_today_category_totals(
-        user_id, today.isoformat()
-    )
+    today_income, today_expense = get_period_totals(user_id, today.isoformat(), today.isoformat())
+    month_income, month_expense = get_period_totals(user_id, month_start.isoformat(), today.isoformat())
+    categories = get_today_category_totals(user_id, today.isoformat())
 
     text = (
         "📊 MOLIYAVIY HISOBOT\n\n"
         "📅 BUGUN\n"
         f"🟢 Kirim: {format_money(today_income)}\n"
         f"🔴 Chiqim: {format_money(today_expense)}\n\n"
-        f"📆 SHU OY ({month_start.strftime('%d.%m')} — "
-        f"{today.strftime('%d.%m.%Y')})\n"
+        f"📆 SHU OY ({month_start.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')})\n"
         f"🟢 Kirim: {format_money(month_income)}\n"
         f"🔴 Chiqim: {format_money(month_expense)}\n"
         f"📈 Oylik farq: {format_money(month_income - month_expense)}"
@@ -635,16 +583,11 @@ async def report_handler(message: Message):
 @router.message(F.text == "📜 Tarix")
 async def history_handler(message: Message):
     rows = get_recent_transactions(message.from_user.id)
-
     if not rows:
-        await message.answer(
-            "📜 Hozircha operatsiyalar yo'q.",
-            reply_markup=main_menu,
-        )
+        await message.answer("📜 Hozircha operatsiyalar yo'q.", reply_markup=main_menu)
         return
 
     text = "📜 OXIRGI OPERATSIYALAR\n\n"
-
     for row in rows:
         sign = "+" if row["kind"] == "income" else "−"
         text += (
@@ -653,26 +596,18 @@ async def history_handler(message: Message):
             f"🏷 {row['category']} | {row['note']}\n\n"
         )
 
-    text += "Operatsiyani o'chirish uchun /delete ID yoz.\n"
-    text += "Masalan: /delete 12"
-
+    text += "Operatsiyani o'chirish uchun /delete ID yoz.\nMasalan: /delete 12"
     await message.answer(text, reply_markup=main_menu)
 
 
 @router.message(Command("delete"))
 async def delete_handler(message: Message):
     parts = (message.text or "").split()
-
     if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer(
-            "Foydalanish: /delete ID\n"
-            "Masalan: /delete 12"
-        )
+        await message.answer("Foydalanish: /delete ID\nMasalan: /delete 12")
         return
 
     transaction_id = int(parts[1])
-    row = None
-
     with get_connection() as conn:
         row = conn.execute("""
             SELECT id, kind, amount, category, note
@@ -687,24 +622,13 @@ async def delete_handler(message: Message):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="🗑 Ha, o'chir",
-                    callback_data=f"delete:yes:{transaction_id}",
-                ),
-                InlineKeyboardButton(
-                    text="❌ Bekor qilish",
-                    callback_data="delete:no",
-                ),
+                InlineKeyboardButton(text="🗑 Ha, o'chir", callback_data=f"delete:yes:{transaction_id}"),
+                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="delete:no"),
             ]
         ]
     )
-
     await message.answer(
-        f"Quyidagi operatsiyani o'chiraymi?\n\n"
-        f"ID: #{row['id']}\n"
-        f"Summa: {format_money(row['amount'])}\n"
-        f"Kategoriya: {row['category']}\n"
-        f"Izoh: {row['note']}",
+        f"Quyidagi operatsiyani o'chiraymi?\n\nID: #{row['id']}\nSumma: {format_money(row['amount'])}\nKategoriya: {row['category']}\nIzoh: {row['note']}",
         reply_markup=kb,
     )
 
@@ -712,7 +636,6 @@ async def delete_handler(message: Message):
 @router.callback_query(F.data.startswith("delete:"))
 async def delete_callback(callback: CallbackQuery):
     parts = callback.data.split(":")
-
     if len(parts) < 2:
         await callback.answer()
         return
@@ -729,29 +652,11 @@ async def delete_callback(callback: CallbackQuery):
 
     transaction_id = int(parts[2])
     deleted = delete_transaction(callback.from_user.id, transaction_id)
-
-    await callback.answer(
-        "Operatsiya o'chirildi." if deleted else "Operatsiya topilmadi."
-    )
-
+    await callback.answer("Operatsiya o'chirildi." if deleted else "Operatsiya topilmadi.")
     if callback.message:
         await callback.message.edit_text(
-            "🗑 Operatsiya o'chirildi."
-            if deleted
-            else "Operatsiya topilmadi yoki oldin o'chirilgan."
+            "🗑 Operatsiya o'chirildi." if deleted else "Operatsiya topilmadi yoki oldin o'chirilgan."
         )
-
-
-# ==================== QARZLAR ====================
-
-@router.message(F.text == "💳 Qarzlar")
-async def debts_handler(message: Message):
-    await message.answer(
-        "💳 QARZLAR\n\n"
-        "Qarzlarni alohida hisoblash funksiyasini keyingi bosqichda qo'shamiz.\n"
-        "Hozircha qarz berish yoki olishni kirim/chiqim sifatida "
-        "kiritishdan oldin ehtiyot bo'ling: bu hali maxsus qarz hisobi emas."
-    )
 
 
 # ==================== AI BO'LIMI ====================
@@ -759,11 +664,10 @@ async def debts_handler(message: Message):
 @router.message(F.text == "🤖 AI yordamchi")
 async def ai_handler(message: Message):
     await message.answer(
-        "🤖 AI yordamchi\n\n"
-        "Groq AI keyingi bosqichda ulanadi.\n"
-        "Hozir oddiy o'zbekcha kirim/chiqim gaplarini "
-        "cheklangan qoidalar orqali taniyman.\n\n"
-        "Masalan: 50 ming ovqatga ketdi"
+        "🤖 **AI Moliya Yordamchisi**\n\n"
+        "Menga ixtiyoriy matn shaklida xarajat yoki daromadingizni yozing "
+        "(masalan: *'Kecha 45 mingga nonushta qildim'*), bot uni sun'iy intellekt orqali o'zi tahlil qilib tasdiqlashga chiqaradi!",
+        parse_mode="Markdown"
     )
 
 
@@ -775,7 +679,8 @@ async def settings_handler(message: Message):
         "⚙️ SOZLAMALAR\n\n"
         "Valyuta: so'm\n"
         "Vaqt zonasi: Asia/Tashkent\n"
-        "Ma'lumotlar bazasi: SQLite\n\n"
+        "Ma'lumotlar bazasi: SQLite\n"
+        "AI Modeli: Groq Llama 3\n\n"
         "Maxfiy kalitlaringizni hech kimga yubormang."
     )
 
@@ -785,11 +690,10 @@ async def settings_handler(message: Message):
 @router.message(F.text)
 async def natural_message_handler(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-
     if not text:
         return
 
-    data = parse_natural_transaction(text)
+    data = await parse_natural_transaction(text)
 
     if data is not None:
         await ask_confirmation(message, message.from_user.id, data)
@@ -810,9 +714,7 @@ async def natural_message_handler(message: Message, state: FSMContext):
 
 async def main():
     if not BOT_TOKEN or BOT_TOKEN == "BU_YERGA_TELEGRAM_BOT_TOKEN":
-        raise RuntimeError(
-            ".env faylida BOT_TOKEN to'g'ri kiritilmagan."
-        )
+        raise RuntimeError(".env faylida BOT_TOKEN to'g'ri kiritilmagan.")
 
     init_db()
 
